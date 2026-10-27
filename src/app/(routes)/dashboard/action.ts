@@ -1,4 +1,5 @@
 'use server'
+
 import { streamText } from 'ai'
 import { createStreamableValue } from '@ai-sdk/rsc'
 import { createGoogleGenerativeAI } from '@ai-sdk/google'
@@ -6,79 +7,93 @@ import { generateEmbedding } from '@/lib/gemini'
 import { db } from '@/server/db'
 
 const google = createGoogleGenerativeAI({
-    apiKey: process.env.GEMINI_API_KEY
+  apiKey: process.env.GEMINI_API_KEY,
 })
 
-export async function askQuestion(question: string, projectId: string) {
-    const stream = await createStreamableValue()
-    const queryVector = await generateEmbedding(question);
-    console.log(queryVector);
-    const vectorQuery = `[${queryVector!.join(",")}]`
+const MAX_CONTEXT_CHARS = 45_000
+const MAX_FILE_CHARS = 8_000
 
-    // Log the vector query for debugging
-    // console.log("Vector Query:", vectorQuery)
+export async function askQuestion(question: string, projectId: string) {
+  const stream = createStreamableValue()
+  const fileReferences: { fileName: string; sourceCode: string; summary: string }[] = []
+
+  try {
+    if (!process.env.GEMINI_API_KEY) {
+      throw new Error('GEMINI_API_KEY is not configured on the server')
+    }
+
+    const normalizedQuestion = question.trim()
+    if (!normalizedQuestion) {
+      throw new Error('Please enter a question')
+    }
+
+    const queryVector = await generateEmbedding(normalizedQuestion)
+    if (!queryVector?.length) {
+      throw new Error('Could not create an embedding for your question. Check the Gemini API key and model access.')
+    }
+
+    const vectorQuery = `[${queryVector.join(',')}]`
 
     const result = await db.$queryRaw`
-    SELECT "fileName", "sourceCode", "summary",
-    1-("summaryEmbedding" <=> ${vectorQuery}::vector) AS "similarity"
-    FROM "SourceCodeEmbedding"
-    -- WHERE 1-("summaryEmbedding" <=> ${vectorQuery}::vector) > 0.5
-    WHERE "projectId" = ${projectId}
-    ORDER BY "similarity" DESC 
-    LIMIT 10
+      SELECT "fileName", "sourceCode", "summary",
+        1 - ("summaryEmbedding" <=> ${vectorQuery}::vector) AS "similarity"
+      FROM "SourceCodeEmbedding"
+      WHERE "projectId" = ${projectId}
+        AND "summaryEmbedding" IS NOT NULL
+      ORDER BY "summaryEmbedding" <=> ${vectorQuery}::vector ASC
+      LIMIT 10
     ` as {
-        fileName: string
-        sourceCode: string
-        summary: string
+      fileName: string
+      sourceCode: string
+      summary: string
+      similarity: number
     }[]
 
-    // Log the result for debugging
-    // console.log("Query Result:", result)
+    if (!result.length) {
+      throw new Error('No indexed code was found for this project. Re-index the repository and try again.')
+    }
 
-    let context = ""
+    fileReferences.push(...result)
+
+    let context = ''
     for (const doc of result) {
-        context += `source: ${doc.fileName}\n code content: ${doc.sourceCode}\n summary of file: ${doc.summary} \n\n `
-    }
-    // console.log("context", context);
-    (async () => {
-        const { textStream } = await streamText({
-            model: google('gemini-3.5-flash'),
-            prompt: `
-            You are a AI code assistant who answers questions about the codebase. Your target  audience  is a technical intern who is new to the codebase.
-             AI assistant is a brand new, powerful, human-like artificial intelligence.
-      The traits of AI include expert knowledge, helpfulness, cleverness, and articulateness.
-      AI is a well-behaved and well-mannered individual.
-      AI is always friendly, kind, and inspiring, and he is eager to provide vivid and thoughtful responses to the user.
-      AI has the sum of all knowledge in their brain, and is able to accurately answer nearly any question about any topic in conversation.
-      If the question is asking about code or a specific file, AI will provide the detailed answer, giving step by step instructions, including code snippets.
-      START CONTEXT BLOCK
-      ${context}
-      END OF CONTEXT BLOCK
+      const entry = [
+        `File: ${doc.fileName}`,
+        `Summary: ${doc.summary || '(no summary available)'}`,
+        `Relevant source excerpt:\n${(doc.sourceCode || '').slice(0, MAX_FILE_CHARS)}`,
+      ].join('\n')
 
-      START QUESTION
-      ${question}
-      END OF QUESTION
-      AI assistant will take into account any CONTEXT BLOCK that is provided in a conversation.
-      If the context does not provide the answer to question, the AI assistant will say, "I'm sorry, but I don't know the answer to that question".
-      AI assistant will not apologize for previous responses, but instead will indicated new information was gained.
-      AI assistant will not invent anything that is not drawn directly from the context.
-      Answer in markdown syntax, with code snippets if needed. Be as detailed as possible. when answering , make sure there is no code block in the response.
-      `,
-        })
-        for await (const chunk of textStream) {
-            stream.update(chunk)
-        }
-        stream.done();
-    })();
-    return {
-        output: stream.value,
-        fileRefernces: result
+      if (context.length + entry.length > MAX_CONTEXT_CHARS) break
+      context += `${entry}\n\n---\n\n`
     }
+
+    const { textStream } = streamText({
+      model: google('gemini-3.6-flash'),
+      system: `You are GitGenius, a concise and accurate senior software engineer helping developers understand a repository.
+Answer the user's question using the repository context. Mention relevant file paths.
+If context does not support an answer, say so and suggest what file or information would be needed.
+Use Markdown. Keep the answer useful and focused. Do not invent codebase details.`,
+      prompt: `Repository context:\n\n${context}\n\nUser question:\n${normalizedQuestion}`,
+      maxOutputTokens: 2048,
+      onError({ error }) {
+        console.error('[GitGenius askQuestion] Gemini streaming error:', error)
+      },
+    })
+
+    for await (const chunk of textStream) {
+      stream.update(chunk)
+    }
+    stream.done()
+  } catch (error) {
+    console.error('[GitGenius askQuestion] Failed:', error)
+    const message =
+      error instanceof Error ? error.message : 'An unexpected error occurred while generating the answer.'
+    stream.update(`Unable to generate an answer: ${message}`)
+    stream.done()
+  }
+
+  return {
+    output: stream.value,
+    fileRefernces: fileReferences,
+  }
 }
-
-
-// link -> GithubRepoLoader + oktokit(further details commits ) + files summary db + commits summary rakhl db +  embedding 
-
-// commits summary 
-
-// qna -> que vector embedding 
